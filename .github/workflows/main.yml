@@ -1,0 +1,121 @@
+name: Build Aseprite (Windows) and Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *" # раз в день
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    env:
+      UPSTREAM_REPO: aseprite/aseprite
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get latest upstream release tag
+        id: upstream
+        shell: pwsh
+        run: |
+          $tag = gh api "repos/${env:UPSTREAM_REPO}/releases/latest" --jq ".tag_name"
+          if (-not $tag) { throw "Cannot resolve upstream latest release tag" }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Get latest fork release tag (if any)
+        id: fork
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $tag = gh api "repos/${env:GITHUB_REPOSITORY}/releases/latest" --jq ".tag_name"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Decide whether to build
+        id: decide
+        shell: pwsh
+        run: |
+          $up = "${{ steps.upstream.outputs.tag }}"
+          $fk = "${{ steps.fork.outputs.tag }}"
+          if ($up -and $fk -and ($up -eq $fk)) {
+            "build=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "No updates. Upstream tag == fork tag ($up)."
+          } else {
+            "build=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "Update found: upstream=$up fork=$fk"
+          }
+
+      - name: Stop if no update
+        if: steps.decide.outputs.build != 'true'
+        shell: pwsh
+        run: |
+          exit 0
+
+      - name: Checkout upstream tag into workspace
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.upstream.outputs.tag }}"
+          git remote add upstream "https://github.com/${env:UPSTREAM_REPO}.git"
+          git fetch upstream --tags
+          git checkout "$tag"
+          git submodule update --init --recursive
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          choco install -y cmake ninja 7zip
+
+      - name: Setup MSVC dev cmd
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # ====== ВАЖНО: тут обычно нужна подготовка Skia (скачивание/сборка/пути) ======
+      - name: Prepare Skia (placeholder)
+        shell: pwsh
+        run: |
+          Write-Host "TODO: подготовьте Skia согласно актуальной инструкции Aseprite (скачать prebuilt Skia или собрать и указать SKIA_DIR)."
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          mkdir build
+          cd build
+          cmake -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_INSTALL_PREFIX=install `
+            ..
+          # TODO: добавьте нужные флаги/переменные для Skia/LAF, как требует Aseprite
+
+      - name: Build + Install
+        shell: pwsh
+        run: |
+          cd build
+          cmake --build . --config Release
+          cmake --install .
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.upstream.outputs.tag }}"
+          mkdir dist
+          cd build\install
+          7z a "..\..\dist\aseprite-$tag-windows-x64.zip" *
+
+      - name: Create GitHub Release + upload artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.upstream.outputs.tag }}"
+          gh release create "$tag" "dist/aseprite-$tag-windows-x64.zip" `
+            --title "Aseprite $tag (Windows x64)" `
+            --notes "Automated build from upstream release $tag."
